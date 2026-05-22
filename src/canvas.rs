@@ -8,8 +8,8 @@ pub struct DrawingCanvas {
     source: BaseSource,
     base: RgbaImage,
     committed: RgbaImage,
-    strokes: Vec<Stroke>,
-    current: Option<Stroke>,
+    elements: Vec<DrawElement>,
+    current: Option<DrawElement>,
     theme: ThemeMode,
 }
 
@@ -19,9 +19,29 @@ pub enum BaseSource {
     Image(DynamicImage),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawingTool {
+    Freehand,
+    Rectangle,
+    Ellipse,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct Stroke {
-    points: Vec<Point>,
+pub enum DrawElement {
+    Freehand {
+        points: Vec<Point>,
+        color: Rgba<u8>,
+    },
+    Rectangle {
+        start: Point,
+        end: Point,
+        color: Rgba<u8>,
+    },
+    Ellipse {
+        start: Point,
+        end: Point,
+        color: Rgba<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,7 +73,7 @@ impl DrawingCanvas {
             source,
             base,
             committed,
-            strokes: Vec::new(),
+            elements: Vec::new(),
             current: None,
             theme,
         }
@@ -74,39 +94,70 @@ impl DrawingCanvas {
         self.rebuild_committed();
     }
 
-    pub fn begin_stroke(&mut self, point: Point) {
-        self.current = Some(Stroke {
-            points: vec![point],
+    pub fn begin_element(&mut self, tool: DrawingTool, point: Point, color: Rgba<u8>) {
+        self.current = Some(match tool {
+            DrawingTool::Freehand => DrawElement::Freehand {
+                points: vec![point],
+                color,
+            },
+            DrawingTool::Rectangle => DrawElement::Rectangle {
+                start: point,
+                end: point,
+                color,
+            },
+            DrawingTool::Ellipse => DrawElement::Ellipse {
+                start: point,
+                end: point,
+                color,
+            },
         });
     }
 
-    pub fn extend_stroke(&mut self, point: Point) {
-        if let Some(stroke) = self.current.as_mut() {
-            if stroke.points.last().copied() != Some(point) {
-                stroke.points.push(point);
+    pub fn extend_current(&mut self, point: Point) {
+        match self.current.as_mut() {
+            Some(DrawElement::Freehand { points, .. }) => {
+                if points.last().copied() != Some(point) {
+                    points.push(point);
+                }
             }
-        } else {
-            self.begin_stroke(point);
+            Some(DrawElement::Rectangle { end, .. } | DrawElement::Ellipse { end, .. }) => {
+                *end = point
+            }
+            None => self.begin_stroke(point),
         }
     }
 
-    pub fn finish_stroke(&mut self) {
-        if let Some(stroke) = self.current.take() {
-            if !stroke.points.is_empty() {
-                draw_stroke(
-                    &mut self.committed,
-                    &stroke,
-                    self.theme.stroke(),
-                    self.metrics.brush_radius_px(),
-                );
-                self.strokes.push(stroke);
+    pub fn finish_current(&mut self) -> bool {
+        if let Some(element) = self.current.take() {
+            if element.is_empty() {
+                return false;
             }
+            draw_element(
+                &mut self.committed,
+                &element,
+                self.metrics.brush_radius_px(),
+            );
+            self.elements.push(element);
+            return true;
         }
+        false
+    }
+
+    pub fn cancel_current(&mut self) -> bool {
+        self.current.take().is_some()
+    }
+
+    pub fn default_stroke_color(&self) -> Rgba<u8> {
+        self.theme.stroke()
+    }
+
+    pub fn begin_stroke(&mut self, point: Point) {
+        self.begin_element(DrawingTool::Freehand, point, self.theme.stroke());
     }
 
     pub fn undo(&mut self) -> bool {
         self.current = None;
-        let did_undo = self.strokes.pop().is_some();
+        let did_undo = self.elements.pop().is_some();
         if did_undo {
             self.rebuild_committed();
         }
@@ -115,21 +166,16 @@ impl DrawingCanvas {
 
     pub fn clear(&mut self) -> bool {
         self.current = None;
-        let had_strokes = !self.strokes.is_empty();
-        self.strokes.clear();
+        let had_strokes = !self.elements.is_empty();
+        self.elements.clear();
         self.committed = self.base.clone();
         had_strokes
     }
 
     pub fn render(&self) -> RgbaImage {
         let mut image = self.committed.clone();
-        if let Some(stroke) = &self.current {
-            draw_stroke(
-                &mut image,
-                stroke,
-                self.theme.stroke(),
-                self.metrics.brush_radius_px(),
-            );
+        if let Some(element) = &self.current {
+            draw_element(&mut image, element, self.metrics.brush_radius_px());
         }
         image
     }
@@ -160,19 +206,23 @@ impl DrawingCanvas {
 
     fn rebuild_committed(&mut self) {
         self.committed = self.base.clone();
-        for stroke in &self.strokes {
-            draw_stroke(
-                &mut self.committed,
-                stroke,
-                self.theme.stroke(),
-                self.metrics.brush_radius_px(),
-            );
+        for element in &self.elements {
+            draw_element(&mut self.committed, element, self.metrics.brush_radius_px());
         }
     }
 
     #[cfg(test)]
     fn stroke_count(&self) -> usize {
-        self.strokes.len()
+        self.elements.len()
+    }
+}
+
+impl DrawElement {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Freehand { points, .. } => points.is_empty(),
+            Self::Rectangle { .. } | Self::Ellipse { .. } => false,
+        }
     }
 }
 
@@ -201,8 +251,20 @@ fn fit_dimensions((src_w, src_h): (u32, u32), (dst_w, dst_h): (u32, u32)) -> (u3
     (width, height)
 }
 
-fn draw_stroke(image: &mut RgbaImage, stroke: &Stroke, color: Rgba<u8>, radius: f32) {
-    let points = curve_points(&stroke.points, image.width(), image.height(), radius);
+fn draw_element(image: &mut RgbaImage, element: &DrawElement, radius: f32) {
+    match element {
+        DrawElement::Freehand { points, color } => draw_freehand(image, points, *color, radius),
+        DrawElement::Rectangle { start, end, color } => {
+            draw_rectangle_outline(image, *start, *end, *color, radius)
+        }
+        DrawElement::Ellipse { start, end, color } => {
+            draw_ellipse_outline(image, *start, *end, *color, radius)
+        }
+    }
+}
+
+fn draw_freehand(image: &mut RgbaImage, stroke_points: &[Point], color: Rgba<u8>, radius: f32) {
+    let points = curve_points(stroke_points, image.width(), image.height(), radius);
     let Some(first) = points.first().copied() else {
         return;
     };
@@ -212,6 +274,77 @@ fn draw_stroke(image: &mut RgbaImage, stroke: &Stroke, color: Rgba<u8>, radius: 
     }
     for points in points.windows(2) {
         draw_segment(image, points[0], points[1], color, radius);
+    }
+}
+
+fn draw_rectangle_outline(
+    image: &mut RgbaImage,
+    start: Point,
+    end: Point,
+    color: Rgba<u8>,
+    radius: f32,
+) {
+    let left = start.x.min(end.x);
+    let right = start.x.max(end.x);
+    let top = start.y.min(end.y);
+    let bottom = start.y.max(end.y);
+    let top_left = Point::new(left, top);
+    let top_right = Point::new(right, top);
+    let bottom_right = Point::new(right, bottom);
+    let bottom_left = Point::new(left, bottom);
+
+    draw_segment(image, top_left, top_right, color, radius);
+    draw_segment(image, top_right, bottom_right, color, radius);
+    draw_segment(image, bottom_right, bottom_left, color, radius);
+    draw_segment(image, bottom_left, top_left, color, radius);
+}
+
+fn draw_ellipse_outline(
+    image: &mut RgbaImage,
+    start: Point,
+    end: Point,
+    color: Rgba<u8>,
+    radius: f32,
+) {
+    let (start_x, start_y) = point_to_pixel(image, start);
+    let (end_x, end_y) = point_to_pixel(image, end);
+    let radius_x = (end_x - start_x).abs() * 0.5;
+    let radius_y = (end_y - start_y).abs() * 0.5;
+    if radius_x <= 0.5 || radius_y <= 0.5 {
+        draw_segment(image, start, end, color, radius);
+        return;
+    }
+
+    let center_x = (start_x + end_x) * 0.5;
+    let center_y = (start_y + end_y) * 0.5;
+    let circumference = std::f32::consts::PI
+        * (3.0 * (radius_x + radius_y)
+            - ((3.0 * radius_x + radius_y) * (radius_x + 3.0 * radius_y)).sqrt());
+    let samples = (circumference / (radius * 0.65).max(1.0))
+        .ceil()
+        .clamp(16.0, 240.0) as u32;
+    let mut previous = None;
+    let mut first = None;
+
+    for step in 0..samples {
+        let theta = std::f32::consts::TAU * step as f32 / samples as f32;
+        let point = point_from_dimensions_pixel(
+            image.width(),
+            image.height(),
+            center_x + radius_x * theta.cos(),
+            center_y + radius_y * theta.sin(),
+        );
+        if first.is_none() {
+            first = Some(point);
+        }
+        if let Some(previous) = previous {
+            draw_segment(image, previous, point, color, radius);
+        }
+        previous = Some(point);
+    }
+
+    if let (Some(previous), Some(first)) = (previous, first) {
+        draw_segment(image, previous, first, color, radius);
     }
 }
 
@@ -378,8 +511,8 @@ mod tests {
     fn draws_continuous_stroke() {
         let mut canvas = DrawingCanvas::blank(metrics(), ThemeMode::Dark);
         canvas.begin_stroke(Point::new(0.1, 0.5));
-        canvas.extend_stroke(Point::new(0.9, 0.5));
-        canvas.finish_stroke();
+        canvas.extend_current(Point::new(0.9, 0.5));
+        canvas.finish_current();
         let image = canvas.render();
 
         for x in 15..85 {
@@ -388,11 +521,57 @@ mod tests {
     }
 
     #[test]
+    fn draws_rectangle_outline_without_filling_center() {
+        let red = Rgba([255, 0, 0, 255]);
+        let mut canvas = DrawingCanvas::blank(metrics(), ThemeMode::Dark);
+        canvas.begin_element(DrawingTool::Rectangle, Point::new(0.2, 0.2), red);
+        canvas.extend_current(Point::new(0.8, 0.8));
+        canvas.finish_current();
+        let image = canvas.render();
+
+        assert_eq!(*image.get_pixel(50, 10), red);
+        assert_eq!(*image.get_pixel(20, 25), red);
+        assert_eq!(*image.get_pixel(50, 25), Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn draws_ellipse_outline_without_filling_center() {
+        let green = Rgba([0, 180, 80, 255]);
+        let mut canvas = DrawingCanvas::blank(metrics(), ThemeMode::Dark);
+        canvas.begin_element(DrawingTool::Ellipse, Point::new(0.2, 0.2), green);
+        canvas.extend_current(Point::new(0.8, 0.8));
+        canvas.finish_current();
+        let image = canvas.render();
+
+        assert_eq!(*image.get_pixel(50, 10), green);
+        assert_eq!(*image.get_pixel(50, 25), Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn committed_elements_keep_their_original_colors_after_resize() {
+        let red = Rgba([255, 0, 0, 255]);
+        let blue = Rgba([30, 100, 255, 255]);
+        let mut canvas = DrawingCanvas::blank(metrics(), ThemeMode::Dark);
+        canvas.begin_element(DrawingTool::Freehand, Point::new(0.1, 0.2), red);
+        canvas.extend_current(Point::new(0.4, 0.2));
+        canvas.finish_current();
+        canvas.begin_element(DrawingTool::Rectangle, Point::new(0.6, 0.6), blue);
+        canvas.extend_current(Point::new(0.9, 0.9));
+        canvas.finish_current();
+
+        canvas.resize(metrics());
+        let image = canvas.render();
+
+        assert_eq!(*image.get_pixel(20, 10), red);
+        assert_eq!(*image.get_pixel(60, 30), blue);
+    }
+
+    #[test]
     fn undo_removes_completed_strokes_many_times() {
         let mut canvas = DrawingCanvas::blank(metrics(), ThemeMode::Dark);
         for x in [0.2, 0.4, 0.6] {
             canvas.begin_stroke(Point::new(x, 0.5));
-            canvas.finish_stroke();
+            canvas.finish_current();
         }
 
         assert_eq!(canvas.stroke_count(), 3);
@@ -407,7 +586,7 @@ mod tests {
     fn clear_removes_strokes_and_preserves_base() {
         let mut canvas = DrawingCanvas::blank(metrics(), ThemeMode::Light);
         canvas.begin_stroke(Point::new(0.5, 0.5));
-        canvas.finish_stroke();
+        canvas.finish_current();
         assert!(canvas.clear());
         assert!(!canvas.undo());
 

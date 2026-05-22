@@ -14,19 +14,22 @@ use crossterm::{
 
 use crate::args::CellPixels;
 
+pub const RESERVED_UI_ROWS: u16 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TerminalMetrics {
+pub struct TerminalLayout {
     pub cols: u16,
     pub rows: u16,
     pub display_width_px: u32,
     pub display_height_px: u32,
-    pub width_px: u32,
-    pub height_px: u32,
     pub cell_width_px: f32,
     pub cell_height_px: f32,
+    pub canvas: TerminalMetrics,
+    pub status_row: Option<u16>,
+    pub input_row: Option<u16>,
 }
 
-impl TerminalMetrics {
+impl TerminalLayout {
     pub fn current(fallback: CellPixels, resolution_scale: f32) -> Self {
         let (cols, rows) = size().unwrap_or((80, 24));
         Self::from_cells(cols, rows, fallback, resolution_scale)
@@ -49,12 +52,72 @@ impl TerminalMetrics {
         Self::from_display_dimensions(
             cols,
             rows,
-            display_width_px.max(1),
-            display_height_px.max(1),
+            display_width_px,
+            display_height_px,
             resolution_scale,
         )
     }
 
+    pub fn from_display_dimensions(
+        cols: u16,
+        rows: u16,
+        display_width_px: u32,
+        display_height_px: u32,
+        resolution_scale: f32,
+    ) -> Self {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let display_width_px = display_width_px.max(1);
+        let display_height_px = display_height_px.max(1);
+        let ui_rows = rows.saturating_sub(1).min(RESERVED_UI_ROWS);
+        let canvas_rows = rows.saturating_sub(ui_rows).max(1);
+        let canvas_display_height_px = ((u64::from(display_height_px) * u64::from(canvas_rows))
+            / u64::from(rows))
+        .max(1) as u32;
+        let status_row = (ui_rows >= 1).then_some(canvas_rows);
+        let input_row = (ui_rows >= 2).then_some(canvas_rows + 1);
+
+        Self {
+            cols,
+            rows,
+            display_width_px,
+            display_height_px,
+            cell_width_px: display_width_px as f32 / f32::from(cols),
+            cell_height_px: display_height_px as f32 / f32::from(rows),
+            canvas: TerminalMetrics::from_display_dimensions(
+                cols,
+                canvas_rows,
+                display_width_px,
+                canvas_display_height_px,
+                resolution_scale,
+            ),
+            status_row,
+            input_row,
+        }
+    }
+
+    pub fn column_for_pixel(self, x: u16) -> u16 {
+        ((f32::from(x) / self.cell_width_px).floor() as u16).min(self.cols.saturating_sub(1))
+    }
+
+    pub fn row_for_pixel(self, y: u16) -> u16 {
+        ((f32::from(y) / self.cell_height_px).floor() as u16).min(self.rows.saturating_sub(1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalMetrics {
+    pub cols: u16,
+    pub rows: u16,
+    pub display_width_px: u32,
+    pub display_height_px: u32,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub cell_width_px: f32,
+    pub cell_height_px: f32,
+}
+
+impl TerminalMetrics {
     #[cfg(test)]
     pub fn from_dimensions(cols: u16, rows: u16, width_px: u32, height_px: u32) -> Self {
         Self::from_display_dimensions(cols, rows, width_px, height_px, 1.0)
@@ -188,5 +251,28 @@ mod tests {
         assert_eq!(metrics.height_px, 240);
         assert_eq!(metrics.cell_width_px, 5.0);
         assert_eq!(metrics.cell_height_px, 10.0);
+    }
+
+    #[test]
+    fn layout_reserves_bottom_ui_rows_for_canvas() {
+        let layout = TerminalLayout::from_display_dimensions(80, 24, 800, 480, 1.0);
+        assert_eq!(layout.canvas.cols, 80);
+        assert_eq!(layout.canvas.rows, 22);
+        assert_eq!(layout.status_row, Some(22));
+        assert_eq!(layout.input_row, Some(23));
+        assert_eq!(layout.canvas.display_height_px, 440);
+    }
+
+    #[test]
+    fn layout_keeps_a_drawable_row_in_tiny_terminals() {
+        let layout = TerminalLayout::from_display_dimensions(10, 1, 100, 20, 1.0);
+        assert_eq!(layout.canvas.rows, 1);
+        assert_eq!(layout.status_row, None);
+        assert_eq!(layout.input_row, None);
+
+        let layout = TerminalLayout::from_display_dimensions(10, 2, 100, 40, 1.0);
+        assert_eq!(layout.canvas.rows, 1);
+        assert_eq!(layout.status_row, Some(1));
+        assert_eq!(layout.input_row, None);
     }
 }

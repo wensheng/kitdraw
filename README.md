@@ -31,7 +31,7 @@
 
 - **Draw directly on your terminal canvas** with Kitty/Ghostty graphics and smooth mouse-driven strokes.
 - **Annotate existing images in place** by loading a PNG/JPEG/etc. and drawing right over it.
-- **Save clean PNG output automatically** with undo, clear, contrast-aware ink, and adjustable render resolution for speed.
+- **Save clean PNG output automatically** with undo, clear, color controls, shape tools, contrast-aware default ink, and adjustable render resolution for speed.
 
 ---
 
@@ -48,10 +48,10 @@ kitdraw screenshot.png --resolution-scale 0.25 -o notes.png
 ## How It Works
 
 ```text
-terminal size -> scaled RGBA canvas -> mouse strokes -> zlib Kitty frames -> autosaved PNG
+terminal size -> scaled RGBA canvas -> mouse strokes/shapes -> zlib Kitty frames -> autosaved PNG
 ```
 
-The fast path is intentionally simple: keep a committed image for completed strokes, preview only the active stroke, compress RGBA frames with Kitty's graphics protocol, and write the final composited canvas as a PNG on exit.
+The fast path is intentionally simple: keep a committed image for completed drawing elements, preview only the active stroke or shape, compress RGBA frames with Kitty's graphics protocol, and write the final composited canvas as a PNG on exit.
 
 ---
 
@@ -59,8 +59,11 @@ The fast path is intentionally simple: keep a committed image for completed stro
 
 | Action | Control |
 | --- | --- |
-| Draw | Left mouse drag |
+| Draw active tool | Left mouse drag |
+| Freehand tool | `f` |
+| Rectangle tool | `r` |
+| Ellipse tool | `e` |
+| Change color | Click a status-bar swatch, or press `c` and enter a color name/hex value |
 | Undo | `z` |
-| Clear drawing layer | `c` |
+| Clear drawing layer | `C` |
 | Save and quit | `q`, `Esc`, or `Ctrl-C` |
-
