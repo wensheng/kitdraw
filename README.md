@@ -1,6 +1,6 @@
 # kitdraw
 
-**Sketch, annotate, and save PNGs without leaving your terminal.**
+**Sketch, annotate, and save PNGs or SVGs without leaving your terminal.**
 
 (kitdraw runs on terminals that supports the Kitty graphics protocol:
 [**Ghostty**](https://ghostty.org/),
@@ -31,7 +31,7 @@
 
 - **Draw directly on your terminal canvas** with Kitty/Ghostty graphics and smooth mouse-driven strokes.
 - **Annotate existing images in place** by loading a PNG/JPEG/etc. and drawing right over it.
-- **Save clean PNG output automatically** with undo, clear, color controls, shape tools, contrast-aware default ink, and adjustable render resolution for speed.
+- **Save clean PNG or SVG output automatically** with undo, clear, color controls, shape tools, arrows, text, highlighter, redaction, contrast-aware default ink, and adjustable render resolution for speed.
 
 ---
 
@@ -41,6 +41,8 @@
 kitdraw
 kitdraw screenshot.png
 kitdraw screenshot.png --resolution-scale 0.25 -o notes.png
+kitdraw screenshot.png -o notes.svg
+kitdraw screenshot.png --export-size canvas -o terminal-sized.png
 ```
 
 ---
@@ -48,10 +50,10 @@ kitdraw screenshot.png --resolution-scale 0.25 -o notes.png
 ## How It Works
 
 ```text
-terminal size -> scaled RGBA canvas -> mouse strokes/shapes -> zlib Kitty frames -> autosaved PNG
+terminal size -> scaled RGBA canvas -> mouse annotations -> zlib Kitty frames -> autosaved PNG/SVG
 ```
 
-The fast path is intentionally simple: keep a committed image for completed drawing elements, preview only the active stroke or shape, compress RGBA frames with Kitty's graphics protocol, and write the final composited canvas as a PNG on exit.
+The fast path is intentionally simple: keep a committed image for completed drawing elements, preview only the active annotation, compress RGBA frames with Kitty's graphics protocol, and write the final composited canvas on exit. Image annotations export at the original image size by default; use `--export-size canvas` to keep the terminal canvas dimensions.
 
 ---
 
@@ -63,6 +65,11 @@ The fast path is intentionally simple: keep a committed image for completed draw
 | Freehand tool | `f` |
 | Rectangle tool | `r` |
 | Ellipse tool | `e` |
+| Arrow tool | `a` |
+| Text tool | `t`, then click, type, and press `Enter` |
+| Highlighter tool | `h` |
+| Redaction tool | `x` |
+| Change stroke/text size | `[` / `]` |
 | Change color | Click a status-bar swatch, or press `c` and enter a color name/hex value |
 | Undo | `z` |
 | Clear drawing layer | `C` |

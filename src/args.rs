@@ -3,19 +3,29 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use clap::{Parser, ValueEnum};
 
+use crate::export::{ExportFormat, ExportSize};
+
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "Draw directly in Kitty-compatible terminals and save to PNG"
+    about = "Draw directly in Kitty-compatible terminals and save to PNG or SVG"
 )]
 pub struct Args {
     /// Optional image to draw on top of.
     pub input_image: Option<PathBuf>,
 
-    /// Save output PNG path. Defaults to kitdraw1.png, kitdraw2.png, etc. or <input-stem>-kitdraw.png.
-    #[arg(short = 'o', long = "output", value_parser = parse_png_output_path)]
+    /// Save output path. Supports .png and .svg.
+    #[arg(short = 'o', long = "output", value_parser = parse_output_path)]
     pub output: Option<PathBuf>,
+
+    /// Output format. Defaults to the output extension, or png when no output path is provided.
+    #[arg(long = "format", value_enum)]
+    pub format: Option<ExportFormat>,
+
+    /// Export dimensions. Defaults to original for input images and canvas for blank drawings.
+    #[arg(long = "export-size", value_enum)]
+    pub export_size: Option<ExportSize>,
 
     /// Drawing polarity for terminal contrast.
     #[arg(long = "theme", value_enum, default_value_t = ThemeArg::Auto)]
@@ -69,18 +79,44 @@ pub fn parse_resolution_scale(value: &str) -> std::result::Result<f32, String> {
     Ok(scale)
 }
 
-pub fn parse_png_output_path(value: &str) -> std::result::Result<PathBuf, String> {
+pub fn parse_output_path(value: &str) -> std::result::Result<PathBuf, String> {
     let path = PathBuf::from(value);
-    if has_png_extension(&path) {
+    if ExportFormat::from_path(&path).is_some() {
         Ok(path)
     } else {
-        Err("output file must have a .png extension".to_string())
+        Err("output file must have a .png or .svg extension".to_string())
     }
 }
 
-pub fn default_output_path(input_image: Option<&Path>) -> PathBuf {
+pub fn resolve_output_format(
+    explicit: Option<ExportFormat>,
+    output: Option<&Path>,
+) -> Result<ExportFormat> {
+    let inferred = output.and_then(ExportFormat::from_path);
+    match (explicit, inferred) {
+        (Some(format), Some(inferred)) if format != inferred => Err(anyhow!(
+            "--format {} conflicts with output extension .{}",
+            format,
+            inferred.extension()
+        )),
+        (Some(format), _) => Ok(format),
+        (None, Some(format)) => Ok(format),
+        (None, None) => Ok(ExportFormat::Png),
+    }
+}
+
+pub fn default_export_size(input_image: Option<&Path>) -> ExportSize {
+    if input_image.is_some() {
+        ExportSize::Original
+    } else {
+        ExportSize::Canvas
+    }
+}
+
+pub fn default_output_path(input_image: Option<&Path>, format: ExportFormat) -> PathBuf {
+    let extension = format.extension();
     let Some(input) = input_image else {
-        return next_available_numbered_path(Path::new("."), "kitdraw");
+        return next_available_numbered_path(Path::new("."), "kitdraw", extension);
     };
 
     let stem = input
@@ -88,7 +124,7 @@ pub fn default_output_path(input_image: Option<&Path>) -> PathBuf {
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.is_empty())
         .unwrap_or("image");
-    let file_name = format!("{stem}-kitdraw.png");
+    let file_name = format!("{stem}-kitdraw.{extension}");
     input
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -96,9 +132,9 @@ pub fn default_output_path(input_image: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(file_name))
 }
 
-fn next_available_numbered_path(directory: &Path, stem: &str) -> PathBuf {
+fn next_available_numbered_path(directory: &Path, stem: &str, extension: &str) -> PathBuf {
     for idx in 1.. {
-        let file_name = format!("{stem}{idx}.png");
+        let file_name = format!("{stem}{idx}.{extension}");
         let candidate = directory.join(file_name);
         if !candidate.exists() {
             return if directory.as_os_str().is_empty() || directory == Path::new(".") {
@@ -115,32 +151,26 @@ fn next_available_numbered_path(directory: &Path, stem: &str) -> PathBuf {
 }
 
 pub fn ensure_output_path(path: &Path) -> Result<()> {
-    if !has_png_extension(path) {
-        return Err(anyhow!("output file must have a .png extension"));
+    if ExportFormat::from_path(path).is_none() {
+        return Err(anyhow!("output file must have a .png or .svg extension"));
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if !parent.exists() {
-                return Err(anyhow!(
-                    "output parent directory does not exist: {}",
-                    parent.display()
-                ));
-            }
-            if !parent.is_dir() {
-                return Err(anyhow!(
-                    "output parent path is not a directory: {}",
-                    parent.display()
-                ));
-            }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        if !parent.exists() {
+            return Err(anyhow!(
+                "output parent directory does not exist: {}",
+                parent.display()
+            ));
+        }
+        if !parent.is_dir() {
+            return Err(anyhow!(
+                "output parent path is not a directory: {}",
+                parent.display()
+            ));
         }
     }
     Ok(())
-}
-
-fn has_png_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
 }
 
 #[cfg(test)]
@@ -168,27 +198,35 @@ mod tests {
     }
 
     #[test]
-    fn parses_output_png_path() {
+    fn parses_output_path() {
         assert_eq!(
-            parse_png_output_path("out.png").unwrap(),
+            parse_output_path("out.png").unwrap(),
             PathBuf::from("out.png")
         );
         assert_eq!(
-            parse_png_output_path("OUT.PNG").unwrap(),
+            parse_output_path("OUT.PNG").unwrap(),
             PathBuf::from("OUT.PNG")
         );
-        assert!(parse_png_output_path("out.jpg").is_err());
-        assert!(parse_png_output_path("out").is_err());
+        assert_eq!(
+            parse_output_path("diagram.svg").unwrap(),
+            PathBuf::from("diagram.svg")
+        );
+        assert!(parse_output_path("out.jpg").is_err());
+        assert!(parse_output_path("out").is_err());
     }
 
     #[test]
     fn derives_default_output_path() {
         assert_eq!(
-            default_output_path(Some(Path::new("photo.jpg"))),
+            default_output_path(Some(Path::new("photo.jpg")), ExportFormat::Png),
             PathBuf::from("photo-kitdraw.png")
         );
         assert_eq!(
-            default_output_path(Some(Path::new("images/photo.jpg"))),
+            default_output_path(Some(Path::new("images/photo.jpg")), ExportFormat::Svg),
+            PathBuf::from("images/photo-kitdraw.svg")
+        );
+        assert_eq!(
+            default_output_path(Some(Path::new("images/photo.jpg")), ExportFormat::Png),
             PathBuf::from("images/photo-kitdraw.png")
         );
     }
@@ -201,13 +239,41 @@ mod tests {
             std::thread::current().name().unwrap_or("test")
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let first = next_available_numbered_path(&dir, "kitdraw");
+        let first = next_available_numbered_path(&dir, "kitdraw", "png");
         assert_eq!(first, dir.join("kitdraw1.png"));
         std::fs::write(&first, []).unwrap();
-        let second = next_available_numbered_path(&dir, "kitdraw");
+        let second = next_available_numbered_path(&dir, "kitdraw", "png");
         assert_eq!(second, dir.join("kitdraw2.png"));
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_output_format() {
+        assert_eq!(
+            resolve_output_format(None, None).unwrap(),
+            ExportFormat::Png
+        );
+        assert_eq!(
+            resolve_output_format(None, Some(Path::new("out.svg"))).unwrap(),
+            ExportFormat::Svg
+        );
+        assert_eq!(
+            resolve_output_format(Some(ExportFormat::Svg), None).unwrap(),
+            ExportFormat::Svg
+        );
+        assert!(
+            resolve_output_format(Some(ExportFormat::Svg), Some(Path::new("out.png"))).is_err()
+        );
+    }
+
+    #[test]
+    fn defaults_export_size_from_input_presence() {
+        assert_eq!(
+            default_export_size(Some(Path::new("photo.jpg"))),
+            ExportSize::Original
+        );
+        assert_eq!(default_export_size(None), ExportSize::Canvas);
     }
 
     #[test]
@@ -217,6 +283,10 @@ mod tests {
             "input.png",
             "-o",
             "out.png",
+            "--format",
+            "png",
+            "--export-size",
+            "original",
             "--theme",
             "light",
             "--cell-px",
@@ -227,6 +297,8 @@ mod tests {
         .unwrap();
         assert_eq!(args.input_image.as_deref(), Some(Path::new("input.png")));
         assert_eq!(args.output.as_deref(), Some(Path::new("out.png")));
+        assert_eq!(args.format, Some(ExportFormat::Png));
+        assert_eq!(args.export_size, Some(ExportSize::Original));
         assert_eq!(args.theme, ThemeArg::Light);
         assert_eq!(
             args.cell_px,

@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -19,7 +19,8 @@ use image::Rgba;
 
 use crate::{
     args::{CellPixels, ensure_output_path},
-    canvas::{BaseSource, DrawingCanvas, DrawingTool, Point},
+    canvas::{BaseSource, DrawStyle, DrawingCanvas, DrawingTool, Point, WidthPreset},
+    export::{self, ExportFormat, ExportSize},
     kitty,
     terminal::{TerminalLayout, TerminalSession},
     theme::ThemeMode,
@@ -32,6 +33,8 @@ const MIN_STATUS_HIT_SLOP_PX: u16 = 4;
 pub struct AppConfig {
     pub input_image: Option<PathBuf>,
     pub output: PathBuf,
+    pub output_format: ExportFormat,
+    pub export_size: ExportSize,
     pub theme: ThemeMode,
     pub fallback_cell_px: CellPixels,
     pub resolution_scale: f32,
@@ -41,19 +44,30 @@ pub struct AppConfig {
 struct AppState {
     tool: DrawingTool,
     color: Rgba<u8>,
-    input_mode: bool,
-    color_buffer: String,
+    width: WidthPreset,
+    input_mode: InputMode,
     message: String,
+    output_format: ExportFormat,
+    export_size: ExportSize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum InputMode {
+    None,
+    Color { buffer: String },
+    Text { position: Point, buffer: String },
 }
 
 impl AppState {
-    fn new(color: Rgba<u8>) -> Self {
+    fn new(color: Rgba<u8>, output_format: ExportFormat, export_size: ExportSize) -> Self {
         Self {
             tool: DrawingTool::Freehand,
             color,
-            input_mode: false,
-            color_buffer: String::new(),
+            width: WidthPreset::Medium,
+            input_mode: InputMode::None,
             message: String::from("Ready"),
+            output_format,
+            export_size,
         }
     }
 
@@ -63,27 +77,29 @@ impl AppState {
     }
 
     fn begin_color_input(&mut self) {
-        self.input_mode = true;
-        self.color_buffer.clear();
+        self.input_mode = InputMode::Color {
+            buffer: String::new(),
+        };
         self.message = String::from("Enter color");
     }
 
     fn cancel_color_input(&mut self) {
-        self.input_mode = false;
-        self.color_buffer.clear();
+        self.input_mode = InputMode::None;
         self.message = String::from("Color unchanged");
     }
 
     fn apply_color_input(&mut self) {
-        match parse_color(&self.color_buffer) {
+        let InputMode::Color { buffer } = &self.input_mode else {
+            return;
+        };
+        match parse_color(buffer) {
             Some(color) => {
                 self.color = color;
-                self.input_mode = false;
+                self.input_mode = InputMode::None;
                 self.message = format!("Color: {}", color_to_hex(color));
-                self.color_buffer.clear();
             }
             None => {
-                let value = self.color_buffer.trim();
+                let value = buffer.trim();
                 self.message = if value.is_empty() {
                     String::from("Enter a color name or hex value")
                 } else {
@@ -95,9 +111,39 @@ impl AppState {
 
     fn set_color(&mut self, color: Rgba<u8>, name: &str) {
         self.color = color;
-        self.input_mode = false;
-        self.color_buffer.clear();
+        self.input_mode = InputMode::None;
         self.message = format!("Color: {name}");
+    }
+
+    fn begin_text_input(&mut self, position: Point) {
+        self.input_mode = InputMode::Text {
+            position,
+            buffer: String::new(),
+        };
+        self.message = String::from("Enter text");
+    }
+
+    fn cancel_text_input(&mut self) {
+        self.input_mode = InputMode::None;
+        self.message = String::from("Text canceled");
+    }
+
+    fn style(&self) -> DrawStyle {
+        match self.tool {
+            DrawingTool::Highlighter => DrawStyle::highlighter(self.color, self.width),
+            DrawingTool::Redaction => DrawStyle::new(Rgba([0, 0, 0, 255]), self.width),
+            _ => DrawStyle::new(self.color, self.width),
+        }
+    }
+
+    fn cycle_width_previous(&mut self) {
+        self.width = self.width.previous();
+        self.message = format!("Size: {}", self.width.label());
+    }
+
+    fn cycle_width_next(&mut self) {
+        self.width = self.width.next();
+        self.message = format!("Size: {}", self.width.label());
     }
 }
 
@@ -169,8 +215,12 @@ pub fn run(config: AppConfig) -> Result<()> {
             DrawingCanvas::new(layout.canvas, BaseSource::Image(image), config.theme)
         }
     };
-    let mut state = AppState::new(canvas.default_stroke_color());
-    let final_image = run_event_loop(
+    let mut state = AppState::new(
+        canvas.default_stroke_color(),
+        config.output_format,
+        config.export_size,
+    );
+    run_event_loop(
         &mut canvas,
         &mut state,
         layout,
@@ -179,7 +229,12 @@ pub fn run(config: AppConfig) -> Result<()> {
     )?;
     drop(session);
 
-    save_png(&config.output, &final_image)?;
+    export::save(
+        &config.output,
+        config.output_format,
+        config.export_size,
+        &canvas,
+    )?;
     println!("Saved {}", config.output.display());
     Ok(())
 }
@@ -190,7 +245,7 @@ fn run_event_loop(
     mut layout: TerminalLayout,
     fallback_cell_px: CellPixels,
     resolution_scale: f32,
-) -> Result<image::RgbaImage> {
+) -> Result<()> {
     let mut stdout = io::stdout().lock();
     render_to_terminal(&mut stdout, canvas, state, layout)?;
     let mut last_render = Instant::now();
@@ -213,14 +268,14 @@ fn run_event_loop(
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
                         if handle_key(key, canvas, state) {
-                            return Ok(canvas.render());
+                            return Ok(());
                         }
                         dirty = true;
                     }
-                    Event::Mouse(mouse) => {
-                        if handle_mouse(mouse, canvas, state, layout, &mut mouse_mapper) {
-                            dirty = true;
-                        }
+                    Event::Mouse(mouse)
+                        if handle_mouse(mouse, canvas, state, layout, &mut mouse_mapper) =>
+                    {
+                        dirty = true;
                     }
                     Event::Resize(cols, rows) => {
                         layout = TerminalLayout::from_cells(
@@ -251,8 +306,10 @@ fn run_event_loop(
 }
 
 fn handle_key(key: KeyEvent, canvas: &mut DrawingCanvas, state: &mut AppState) -> bool {
-    if state.input_mode {
-        return handle_color_input_key(key, state);
+    match &state.input_mode {
+        InputMode::Color { .. } => return handle_color_input_key(key, state),
+        InputMode::Text { .. } => return handle_text_input_key(key, canvas, state),
+        InputMode::None => {}
     }
 
     match key.code {
@@ -278,6 +335,26 @@ fn handle_key(key: KeyEvent, canvas: &mut DrawingCanvas, state: &mut AppState) -
             state.set_tool(DrawingTool::Ellipse);
             false
         }
+        KeyCode::Char('a') => {
+            canvas.cancel_current();
+            state.set_tool(DrawingTool::Arrow);
+            false
+        }
+        KeyCode::Char('t') => {
+            canvas.cancel_current();
+            state.set_tool(DrawingTool::Text);
+            false
+        }
+        KeyCode::Char('h') => {
+            canvas.cancel_current();
+            state.set_tool(DrawingTool::Highlighter);
+            false
+        }
+        KeyCode::Char('x') => {
+            canvas.cancel_current();
+            state.set_tool(DrawingTool::Redaction);
+            false
+        }
         KeyCode::Char('c') => {
             state.begin_color_input();
             false
@@ -285,6 +362,14 @@ fn handle_key(key: KeyEvent, canvas: &mut DrawingCanvas, state: &mut AppState) -
         KeyCode::Char('C') => {
             canvas.clear();
             state.message = String::from("Drawing layer cleared");
+            false
+        }
+        KeyCode::Char('[') => {
+            state.cycle_width_previous();
+            false
+        }
+        KeyCode::Char(']') => {
+            state.cycle_width_next();
             false
         }
         _ => false,
@@ -306,11 +391,54 @@ fn handle_color_input_key(key: KeyEvent, state: &mut AppState) -> bool {
             false
         }
         KeyCode::Backspace => {
-            state.color_buffer.pop();
+            if let InputMode::Color { buffer } = &mut state.input_mode {
+                buffer.pop();
+            }
             false
         }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
-            state.color_buffer.push(ch);
+            if let InputMode::Color { buffer } = &mut state.input_mode {
+                buffer.push(ch);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_text_input_key(key: KeyEvent, canvas: &mut DrawingCanvas, state: &mut AppState) -> bool {
+    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.cancel_text_input();
+            false
+        }
+        KeyCode::Enter => {
+            let InputMode::Text { position, buffer } =
+                std::mem::replace(&mut state.input_mode, InputMode::None)
+            else {
+                return false;
+            };
+            if canvas.add_text(position, buffer, state.style()) {
+                state.message = String::from("Text added");
+            } else {
+                state.message = String::from("Text skipped");
+            }
+            false
+        }
+        KeyCode::Backspace => {
+            if let InputMode::Text { buffer, .. } = &mut state.input_mode {
+                buffer.pop();
+            }
+            false
+        }
+        KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            if let InputMode::Text { buffer, .. } = &mut state.input_mode {
+                buffer.push(ch);
+            }
             false
         }
         _ => false,
@@ -324,11 +452,19 @@ fn handle_mouse(
     layout: TerminalLayout,
     mouse_mapper: &mut MouseMapper,
 ) -> bool {
+    if !matches!(state.input_mode, InputMode::None) {
+        return false;
+    }
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             match mouse_mapper.target_for_mouse(mouse, layout, canvas) {
                 MouseTarget::Canvas(point) => {
-                    canvas.begin_element(state.tool, point, state.color);
+                    if state.tool == DrawingTool::Text {
+                        state.begin_text_input(point);
+                    } else {
+                        canvas.begin_element(state.tool, point, state.style());
+                    }
                     true
                 }
                 MouseTarget::Status { column } => {
@@ -521,21 +657,28 @@ fn write_status_row<W: Write>(writer: &mut W, state: &AppState, cols: u16) -> Re
 
 fn status_prefix(state: &AppState) -> String {
     format!(
-        "Tool {}:{} | Color {} | Palette",
+        "Tool {}:{} | Size {} | Color {} | {} {} | Palette",
         tool_shortcut(state.tool),
         tool_label(state.tool),
-        color_to_hex(state.color)
+        state.width.label(),
+        color_to_hex(state.color),
+        state.output_format,
+        state.export_size
     )
 }
 
 fn input_row_text(state: &AppState) -> String {
-    if state.input_mode {
-        format!("Color> {}  Enter apply, Esc cancel", state.color_buffer)
-    } else {
-        format!(
-            "{} | f freehand r rectangle e ellipse c color C clear z undo q save",
+    match &state.input_mode {
+        InputMode::Color { buffer } => {
+            format!("Color> {buffer}  Enter apply, Esc cancel")
+        }
+        InputMode::Text { buffer, .. } => {
+            format!("Text> {buffer}  Enter apply, Esc cancel")
+        }
+        InputMode::None => format!(
+            "{} | f freehand r rectangle e ellipse a arrow t text h highlight x redact [ ] size c color C clear z undo q save",
             state.message
-        )
+        ),
     }
 }
 
@@ -569,6 +712,10 @@ fn tool_label(tool: DrawingTool) -> &'static str {
         DrawingTool::Freehand => "freehand",
         DrawingTool::Rectangle => "rectangle",
         DrawingTool::Ellipse => "ellipse",
+        DrawingTool::Arrow => "arrow",
+        DrawingTool::Text => "text",
+        DrawingTool::Highlighter => "highlight",
+        DrawingTool::Redaction => "redact",
     }
 }
 
@@ -577,6 +724,10 @@ fn tool_shortcut(tool: DrawingTool) -> char {
         DrawingTool::Freehand => 'f',
         DrawingTool::Rectangle => 'r',
         DrawingTool::Ellipse => 'e',
+        DrawingTool::Arrow => 'a',
+        DrawingTool::Text => 't',
+        DrawingTool::Highlighter => 'h',
+        DrawingTool::Redaction => 'x',
     }
 }
 
@@ -648,13 +799,6 @@ fn truncate_to_cols(text: &str, cols: u16) -> String {
     text.chars().take(cols as usize).collect()
 }
 
-fn save_png(path: &Path, image: &image::RgbaImage) -> Result<()> {
-    ensure_output_path(path)?;
-    image
-        .save(path)
-        .with_context(|| format!("failed to write PNG output {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,7 +812,11 @@ mod tests {
     }
 
     fn state() -> AppState {
-        AppState::new(Rgba([255, 255, 255, 255]))
+        AppState::new(
+            Rgba([255, 255, 255, 255]),
+            ExportFormat::Png,
+            ExportSize::Canvas,
+        )
     }
 
     fn layout() -> TerminalLayout {
@@ -702,18 +850,43 @@ mod tests {
             &mut state
         ));
         assert_eq!(state.tool, DrawingTool::Freehand);
+        for (shortcut, tool) in [
+            ('a', DrawingTool::Arrow),
+            ('t', DrawingTool::Text),
+            ('h', DrawingTool::Highlighter),
+            ('x', DrawingTool::Redaction),
+        ] {
+            assert!(!handle_key(
+                KeyEvent::new(KeyCode::Char(shortcut), KeyModifiers::NONE),
+                &mut canvas,
+                &mut state
+            ));
+            assert_eq!(state.tool, tool);
+        }
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+            &mut canvas,
+            &mut state
+        ));
+        assert_eq!(state.width, WidthPreset::Large);
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            &mut canvas,
+            &mut state
+        ));
+        assert_eq!(state.width, WidthPreset::Medium);
         assert!(!handle_key(
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
             &mut canvas,
             &mut state
         ));
-        assert!(state.input_mode);
+        assert!(matches!(state.input_mode, InputMode::Color { .. }));
         assert!(!handle_key(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             &mut canvas,
             &mut state
         ));
-        assert!(!state.input_mode);
+        assert_eq!(state.input_mode, InputMode::None);
         assert!(!handle_key(
             KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT),
             &mut canvas,
@@ -844,11 +1017,13 @@ mod tests {
             &mut canvas,
             &mut state
         ));
-        assert!(state.input_mode);
+        assert!(matches!(state.input_mode, InputMode::Color { .. }));
         assert_eq!(state.color, Rgba([255, 255, 255, 255]));
         assert!(state.message.contains("Unknown color"));
 
-        state.color_buffer.clear();
+        state.input_mode = InputMode::Color {
+            buffer: String::new(),
+        };
         for ch in "#123456".chars() {
             assert!(!handle_key(
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
@@ -861,8 +1036,30 @@ mod tests {
             &mut canvas,
             &mut state
         ));
-        assert!(!state.input_mode);
+        assert_eq!(state.input_mode, InputMode::None);
         assert_eq!(state.color, Rgba([18, 52, 86, 255]));
+    }
+
+    #[test]
+    fn text_prompt_commits_text_element() {
+        let mut canvas = canvas();
+        let mut state = state();
+        state.set_tool(DrawingTool::Text);
+        state.begin_text_input(Point::new(0.2, 0.2));
+        for ch in "Hi".chars() {
+            assert!(!handle_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut canvas,
+                &mut state
+            ));
+        }
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut canvas,
+            &mut state
+        ));
+        assert_eq!(state.input_mode, InputMode::None);
+        assert!(canvas.undo());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "kitdraw"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Draw in terminal"
 license = "MIT"
@@ -10,6 +10,7 @@ keywords = ["cli", "utility", "image", "png"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+ab_glyph = "0.2"
 anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
