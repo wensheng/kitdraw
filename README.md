@@ -2,6 +2,13 @@
 
 **Sketch, annotate, and save PNGs or SVGs without leaving your terminal.**
 
+(Part of kit* series of graphic terminal apps:
+[kitim](https://github.com/wensheng/kitim)
+[kitmd](https://github.com/wensheng/kitmd)
+[kitpdf](https://github.com/wensheng/kitpdf)
+[kitdraw](https://github.com/wensheng/kitdraw)
+[kitDOOM](https://github.com/wensheng/kitdoom))
+
 (kitdraw runs on terminals that supports the Kitty graphics protocol:
 [**Ghostty**](https://ghostty.org/),
 [**Kitty**](https://sw.kovidgoyal.net/kitty/),
